@@ -1,95 +1,9 @@
-// @ts-ignore
-import * as path from 'path';
 import * as fs from 'fs';
 import * as grpc from '@grpc/grpc-js';
-import * as protoLoader from '@grpc/proto-loader';
-import { sha3 } from './hash/sha3';
-import { ABIParameter } from './types';
-
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const EthereumTx = require('ethereumjs-tx').Transaction;
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const { formatters } = require('web3-core-helpers');
-
-const PROTO_PATH = [
-  path.join(__dirname, '../services/remix-tests.proto'),
-  path.join(__dirname, '../services/client-call.proto'),
-  path.join(__dirname, '../services/remix-debug.proto'),
-];
-const packageDefinition = protoLoader.loadSync(PROTO_PATH, {
-  keepCase: true,
-  longs: String,
-  enums: String,
-  defaults: true,
-  oneofs: true,
-});
-const protoDescriptor = grpc.loadPackageDefinition(packageDefinition) as any;
-
-// client-call grpc
-const clientCallPB = protoDescriptor.eth_client_call;
-let clientCallClient: any;
-try {
-  clientCallClient = new clientCallPB.ClientCallService('cc.ethcode.dev:50053', grpc.credentials.createInsecure());
-  // clientCallClient = new clientCallPB.ClientCallService('192.168.1.116:50053', grpc.credentials.createInsecure());
-} catch (e) {
-  // @ts-ignore
-  process.send({ error: e });
-}
-
-// sign an unsigned raw transaction and deploy
-function deployUnsignedTx(meta: any, tx: any, privateKey: any, testnetId?: any) {
-  try {
-    // eslint-disable-next-line no-param-reassign
-    tx = JSON.parse(tx);
-    const txData = formatters.inputTransactionFormatter(tx);
-    const chainId = Number(testnetId);
-    const unsignedTransaction = new EthereumTx(
-      {
-        from: txData.from || '0x',
-        nonce: txData.nonce || '0x',
-        gasPrice: txData.gasPrice,
-        gas: txData.gas || '0x',
-        to: txData.to || '0x',
-        value: txData.value || '0x',
-        data: txData.data || '0x',
-      },
-      { chain: chainId }
-    );
-    const pvtk = Buffer.from(privateKey, 'hex');
-    unsignedTransaction.sign(pvtk);
-    const rlpEncoded = unsignedTransaction.serialize().toString('hex');
-    const rawTransaction = `0x${rlpEncoded}`;
-    const transactionHash = sha3(rawTransaction);
-    // @ts-ignore
-    process.send({ responses: transactionHash });
-    const c = {
-      callInterface: {
-        command: 'deploy-signed-tx',
-        payload: rawTransaction,
-        testnetId,
-      },
-    };
-
-    const call = clientCallClient.RunDeploy(c, meta, (err: any) => {
-      if (err) {
-        console.error(err);
-      }
-    });
-
-    call.on('data', (data: any) => {
-      // @ts-ignore
-      process.send({ transactionResult: data.result });
-    });
-    call.on('error', (err: Error) => {
-      // @ts-ignore
-      process.send({ error: err });
-    });
-  } catch (error) {
-    console.log(error);
-    // @ts-ignore
-    process.send({ error: error.message });
-  }
-}
+import { ABIParameter } from '../types';
+import { EstimateGasReq } from '../services/ethereum_pb';
+import { clientCallClient } from './proto';
+import { deployUnsignedTx, deployGanacheTx } from './deployUnsignedTransaction';
 
 // create constructor input file
 function writeConstrucor(path: string, inputs: Array<ABIParameter>) {
@@ -98,33 +12,20 @@ function writeConstrucor(path: string, inputs: Array<ABIParameter>) {
 
 process.on('message', async (m) => {
   const meta = new grpc.Metadata();
-  if (m.authToken) {
-    meta.add('token', m.authToken.token);
-    meta.add('appId', m.authToken.appId);
-  }
   // Fetch accounts and balance
   if (m.command === 'get-accounts') {
     const c = {
-      callInterface: {
-        command: 'get-accounts',
-      },
+      networkid: m.testnetId,
     };
-    const call = clientCallClient.RunDeploy(c, meta, (err: any, response: any) => {
+    clientCallClient.GetGanacheAccounts(c, meta, (err: any, response: any) => {
       if (err) {
         console.log('err', err);
         // @ts-ignore
-        process.exit(1);
+        process.send({ error: err });
       } else {
         // @ts-ignore
-        process.send({ response });
+        process.send({ accounts: response.accounts, balance: response.balance });
       }
-    });
-
-    call.on('data', (data: any) => {
-      // @ts-ignore
-      const result = JSON.parse(data.result);
-      // @ts-ignore
-      process.send({ accounts: result.accounts, balance: result.balance });
     });
   }
   // send wei value to address in other testnets
@@ -184,71 +85,27 @@ process.on('message', async (m) => {
       process.send({ transactionResult: data.result });
     });
   }
-  // fetch balance of a account
+  // fetch balance of an account
   if (m.command === 'get-balance') {
-    const hashAddr = m.account.checksumAddr ? m.account.checksumAddr : m.account.value;
+    const hashAddr = m.account;
     const c = {
-      callInterface: {
-        command: 'get-balance',
-        payload: hashAddr,
-        testnetId: m.testnetId,
-      },
+      networkid: m.testnetId,
+      address: hashAddr,
     };
-    const call = clientCallClient.RunDeploy(c, meta, (err: any, response: any) => {
+    clientCallClient.GetBalance(c, meta, (err: any, response: any) => {
       if (err) {
         // @ts-ignore
         process.send({ error: err });
       } else {
         // @ts-ignore
-        process.send({ response });
+        process.send({ balance: response.balance });
       }
-    });
-    call.on('data', (data: any) => {
-      // @ts-ignore
-      process.send({ balance: data.result });
     });
   }
   // Deploy
   if (m.command === 'deploy-contract') {
-    if (m.authToken) {
-      // @ts-ignore
-      process.send({ authToken: m.authToken });
-    }
-    const { from, abi, bytecode, params, gasSupply } = m.payload;
-    const inp = {
-      from,
-      abi,
-      bytecode,
-      params,
-      gasSupply: typeof gasSupply === 'string' ? parseInt(gasSupply, 10) : gasSupply,
-    };
-    const c = {
-      callInterface: {
-        command: 'deploy-contract',
-        payload: JSON.stringify(inp),
-        testnetId: m.testnetId,
-      },
-    };
-    const call = clientCallClient.RunDeploy(c, meta, (err: any, response: any) => {
-      if (err) {
-        // @ts-ignore
-        process.send({ error: err });
-      } else {
-        // @ts-ignore
-        process.send({ response });
-      }
-    });
-    call.on('data', (data: any) => {
-      // @ts-ignore
-      process.send({ deployedResult: data.result });
-    });
-    call.on('end', () => {
-      process.exit(0);
-    });
-    call.on('error', (err: Error) => {
-      // @ts-ignore
-      process.send({ error: err });
-    });
+    const { unsignedTx } = m.payload;
+    deployGanacheTx(meta, unsignedTx, m.testnetId);
   }
   // Method call
   if (m.command === 'ganache-contract-method-call') {
@@ -334,30 +191,22 @@ process.on('message', async (m) => {
   // Gas Estimate
   if (m.command === 'get-gas-estimate') {
     const { abi, bytecode, params, from } = m.payload;
-    const inp = { abi, bytecode, params, from };
-    const c = {
-      callInterface: {
-        command: 'get-gas-estimate',
-        payload: JSON.stringify(inp),
-        testnetId: m.testnetId,
-      },
-    };
-    const call = clientCallClient.RunDeploy(c, meta, (err: any, response: any) => {
+    const c = new EstimateGasReq();
+    c.setNetworkid(m.testnetId);
+    c.setAbi(JSON.stringify(abi));
+    c.setBytecode(bytecode);
+    c.setParams(JSON.stringify(params));
+    c.setFromaddress(from);
+    c.setValue(0);
+    console.log(c.toObject());
+    clientCallClient.EstimateGas(c.toObject(), meta, (err: any, response: any) => {
       if (err) {
         // @ts-ignore
         process.send({ error: err });
       } else {
         // @ts-ignore
-        process.send({ response });
+        process.send({ gasEstimate: response.result });
       }
-    });
-    call.on('data', (data: any) => {
-      // @ts-ignore
-      process.send({ gasEstimate: data.result });
-    });
-    call.on('error', (err: Error) => {
-      // @ts-ignore
-      process.send({ error: err });
     });
   }
   // Build raw transaction for contract creation
